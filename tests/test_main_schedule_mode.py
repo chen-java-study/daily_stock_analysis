@@ -44,11 +44,24 @@ def _api_app_stub_modules():
     api_app_mod = types.ModuleType("api.app")
     api_app_mod.app = SimpleNamespace()
     api_pkg.app = api_app_mod
-    return {"api": api_pkg, "api.app": api_app_mod}
+    middlewares_pkg = types.ModuleType("api.middlewares")
+    guard_mod = types.ModuleType("api.middlewares.security_guard")
+    guard_mod.uvicorn_proxy_kwargs = lambda: {}
+    middlewares_pkg.security_guard = guard_mod
+    api_pkg.middlewares = middlewares_pkg
+    return {
+        "api": api_pkg,
+        "api.app": api_app_mod,
+        "api.middlewares": middlewares_pkg,
+        "api.middlewares.security_guard": guard_mod,
+    }
 
 
 class _DummyConfig(SimpleNamespace):
     def validate(self):
+        return []
+
+    def validate_structured(self):
         return []
 
 
@@ -422,6 +435,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
             run_immediately,
             background_tasks=None,
             schedule_time_provider=None,
+            pass_scheduled_for=False,
         ):
             scheduled_call["schedule_time"] = schedule_time
             scheduled_call["run_immediately"] = run_immediately
@@ -454,7 +468,8 @@ class MainScheduleModeTestCase(unittest.TestCase):
         )
         run_full_analysis.assert_called_once_with(config, args, None)
         warning_log.assert_any_call(
-            "定时模式下检测到 --stocks 参数；计划执行将忽略启动时股票快照，并在每次运行前重新读取最新的 STOCK_LIST。"
+            "--stocks flag detected in schedule mode; scheduled runs will ignore the startup stock snapshot "
+            "and reload the latest STOCK_LIST before each run."
         )
 
     def test_standalone_run_resolves_stocks_before_run_full_analysis(self) -> None:
@@ -604,6 +619,26 @@ class MainScheduleModeTestCase(unittest.TestCase):
         self.assertIsNone(run_full_analysis.call_args.args[2])
         self.assertIsNone(run_full_analysis.call_args.kwargs.get("analysis_targets"))
 
+    def test_etf_rotation_skips_unrelated_stock_lists_and_reaches_service(self) -> None:
+        for explicit_stocks in (None, "999999.CSI"):
+            with self.subTest(stocks=explicit_stocks):
+                args = self._make_args(etf_rotation=True, stocks=explicit_stocks, no_notify=True)
+                config = self._make_config(stock_list=["999999.CSI"])
+                with (
+                    patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}),
+                    patch("main.parse_arguments", return_value=args),
+                    patch("main.get_config", return_value=config),
+                    patch("main.setup_logging"),
+                    patch("main._refresh_stock_index_cache_for_analysis") as refresh,
+                    patch("main._classify_stock_list_tokens") as classify,
+                    patch("src.services.etf_rotation_service.run_etf_rotation") as run,
+                ):
+                    run.return_value = SimpleNamespace(as_of=date(2025, 6, 6), target_weights={}, failed_codes={})
+                    self.assertEqual(main.main(), 0)
+                run.assert_called_once_with(config, send_notification=False)
+                refresh.assert_not_called()
+                classify.assert_not_called()
+
     def test_actions_backtest_with_bad_stock_list_reaches_backtest_service(self) -> None:
         """Review 反例：`GITHUB_ACTIONS=true` + `--backtest` 时不消费个股列表，
         含未登记 `.CSI` 的 STOCK_LIST 不得整批拒绝，必须进入回测分支。"""
@@ -662,7 +697,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
         self.assertEqual(exit_code, 1)
         run_full_analysis.assert_not_called()
         error_log.assert_any_call(
-            "%s 包含不支持的目标 %r：%s；本轮不执行任何分析。",
+            "%s contains unsupported target %r: %s; skipping all analysis for this run.",
             "GitHub Actions STOCK_LIST",
             "930956.CSI",
             unittest.mock.ANY,
@@ -792,6 +827,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
             run_immediately,
             background_tasks=None,
             schedule_time_provider=None,
+            pass_scheduled_for=False,
         ):
             scheduled_call["schedule_time"] = schedule_time
             scheduled_call["run_immediately"] = run_immediately
@@ -828,7 +864,8 @@ class MainScheduleModeTestCase(unittest.TestCase):
         )
         run_full_analysis.assert_called_once_with(config, args, None)
         warning_log.assert_any_call(
-            "定时模式下检测到 --stocks 参数；计划执行将忽略启动时股票快照，并在每次运行前重新读取最新的 STOCK_LIST。"
+            "--stocks flag detected in schedule mode; scheduled runs will ignore the startup stock snapshot "
+            "and reload the latest STOCK_LIST before each run."
         )
 
     def test_serve_only_with_bad_stocks_token_enters_service_loop(self) -> None:
@@ -987,6 +1024,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
             run_immediately,
             background_tasks=None,
             schedule_time_provider=None,
+            pass_scheduled_for=False,
         ):
             scheduled_call["schedule_time"] = schedule_time
             scheduled_call["resolved_schedule_time"] = (
@@ -1010,6 +1048,42 @@ class MainScheduleModeTestCase(unittest.TestCase):
         )
         run_full_analysis.assert_called_once_with(runtime_config, args, None)
 
+    def test_claimed_analysis_does_not_refresh_watchlist_again(self) -> None:
+        config = self._make_config(stock_list=["600519"], refresh_stock_list=MagicMock())
+        args = self._make_args()
+        with patch("main._refresh_stock_index_cache_for_analysis"), \
+             patch("main._compute_trading_day_filter", return_value=(["600519"], "", True)) as trading_filter:
+            self.assertTrue(main.run_full_analysis(config, args, refresh_watchlist=False))
+        config.refresh_stock_list.assert_not_called()
+        self.assertEqual(trading_filter.call_args.args[2], ["600519"])
+
+    def test_cli_and_runtime_claim_same_final_workload_and_report_duplicate_as_skip(self) -> None:
+        from src.services.runtime_scheduler import RuntimeSchedulerService
+
+        args = self._make_args(schedule=True)
+        config = self._make_config(
+            database_path=str(Path(self.temp_dir.name) / "analysis.db"),
+            stock_list=["600519"],
+        )
+        with patch("main.parse_arguments", return_value=args), \
+             patch("main.get_config", return_value=config), \
+             patch("main._reload_runtime_config", return_value=config), \
+             patch("main.setup_logging"), \
+             patch("main.run_full_analysis", return_value=True) as run_full, \
+             patch("src.scheduler.run_with_schedule") as schedule_runner:
+            self.assertEqual(main.main(), 0)
+            self.assertTrue(schedule_runner.call_args.kwargs["pass_scheduled_for"])
+            due = datetime(2026, 10, 2, 18, tzinfo=timezone.utc)
+            schedule_runner.call_args.kwargs["task"](scheduled_for=due)
+            service = RuntimeSchedulerService()
+            self.assertTrue(service._run_analysis_locked(None, scheduled_for=due))
+            self.assertEqual(service.status()["last_skip_reason"], "scheduled_occurrence_already_claimed")
+            self.assertIsNone(service.status()["last_success_at"])
+            run_full.assert_called_once()
+            self.assertFalse(run_full.call_args.kwargs["refresh_watchlist"])
+            self.assertEqual(run_full.call_args.args[0].stock_list, ["600519"])
+            self.assertEqual(run_full.call_args.args[1]._scheduled_for, due)
+
     def test_schedule_mode_raises_task_failure_when_analysis_returns_false(self) -> None:
         args = self._make_args(schedule=True)
         runtime_config = self._make_config(schedule_enabled=True, schedule_time="09:30")
@@ -1021,6 +1095,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
             run_immediately,
             background_tasks=None,
             schedule_time_provider=None,
+            pass_scheduled_for=False,
         ):
             scheduled_call["task"] = task
 
@@ -1056,6 +1131,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
             run_immediately,
             background_tasks=None,
             schedule_time_provider=None,
+            pass_scheduled_for=False,
         ):
             scheduled_call["schedule_time"] = schedule_time
             scheduled_call["run_immediately"] = run_immediately
@@ -1091,7 +1167,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
             background_task["task"]()
 
         worker.run_once.assert_called_once_with()
-        info_log.assert_any_call("[EventMonitor] 本轮触发 %d 条提醒", 2)
+        info_log.assert_any_call("[EventMonitor] Triggered %d alert(s) in this cycle", 2)
 
     def test_schedule_mode_registers_event_monitor_worker_without_legacy_rules(self) -> None:
         args = self._make_args(schedule=True)
@@ -1110,6 +1186,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
             run_immediately,
             background_tasks=None,
             schedule_time_provider=None,
+            pass_scheduled_for=False,
         ):
             scheduled_call["background_tasks"] = background_tasks or []
 
@@ -1224,6 +1301,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
             run_immediately,
             background_tasks=None,
             schedule_time_provider=None,
+            pass_scheduled_for=False,
         ):
             scheduled_call["schedule_time"] = schedule_time
             scheduled_call["run_immediately"] = run_immediately
@@ -1370,7 +1448,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
         run_with_lock.assert_called_once_with(config, args, None, None)
         start_bots.assert_called_once_with(config)
         exception_log.assert_any_call(
-            "Futu 持仓导入失败，Web/API 服务继续运行: %s",
+            "Futu portfolio import failed, Web/API server continues running: %s",
             error,
         )
 
@@ -2707,7 +2785,7 @@ class MainScheduleModeTestCase(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         output = capture_stream.getvalue()
-        self.assertIn("加载配置失败", output)
+        self.assertIn("Failed to load config", output)
         self.assertIn("config boom", output)
 
     def test_bootstrap_logging_failure_does_not_block_startup(self) -> None:
@@ -2755,9 +2833,9 @@ class MainScheduleModeTestCase(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         run_mock.assert_called_once()
         output = capture_stream.getvalue()
-        self.assertIn("文件日志初始化失败，已降级为控制台日志输出", output)
+        self.assertIn("File logging initialization failed, degraded to console output", output)
         self.assertIn("/app/logs", output)
-        self.assertIn("官方 Docker 镜像启动入口会自动修复默认挂载目录权限", output)
+        self.assertIn("The official Docker image entrypoint automatically fixes default mount permissions", output)
 
     def test_run_full_analysis_import_failure_propagates(self) -> None:
         """P1: import failures in run_full_analysis must propagate, not be swallowed."""

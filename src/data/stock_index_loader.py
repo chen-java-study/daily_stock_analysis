@@ -49,6 +49,8 @@ _STOCK_INDEX_CACHE: Dict[str, str] | None = None
 _STOCK_CODE_LOOKUP_CACHE: Dict[str, str] | None = None
 _STOCK_CODE_CANDIDATES_CACHE: Dict[str, tuple[str, ...]] | None = None
 _ACTIVE_INDEX_ROWS_CACHE: list | None = None
+_CHAT_INDEX_PAYLOAD_CACHE: list | None = None
+_CHAT_STOCK_LOOKUP_CACHE: dict | None = None
 _REMOTE_INDEX_VALIDITY_CACHE: tuple[Path, float, int, bool] | None = None
 _STOCK_INDEX_CACHE_LOCK = RLock()
 
@@ -204,7 +206,7 @@ def _get_stock_index_signature(index_path: Path) -> tuple[float, int] | None:
     try:
         stat_result = index_path.stat()
     except OSError as exc:
-        logger.debug("[股票名称] 读取股票索引元数据失败 %s: %s", index_path, exc)
+        logger.debug("[StockName] Failed to read stock index metadata %s: %s", index_path, exc)
         return None
     if not index_path.is_file():
         return None
@@ -290,13 +292,13 @@ def get_stock_name_index_map() -> Dict[str, str]:
                 else:
                     _STOCK_INDEX_CACHE = _load_stock_index_file(index_path)
                 logger.debug(
-                    "[股票名称] 已加载前端股票索引映射: %s (%d 条)",
+                    "[StockName] Loaded frontend stock index mapping: %s (%d entries)",
                     index_path,
                     len(_STOCK_INDEX_CACHE),
                 )
                 return _STOCK_INDEX_CACHE
             except (OSError, TypeError, ValueError) as exc:
-                logger.debug("[股票名称] 读取股票索引失败 %s: %s", index_path, exc)
+                logger.debug("[StockName] Failed to read stock index %s: %s", index_path, exc)
 
         _STOCK_INDEX_CACHE = {}
         return _STOCK_INDEX_CACHE
@@ -368,7 +370,7 @@ def get_stock_code_candidates_map() -> Dict[str, tuple[str, ...]]:
                     merged_candidates.setdefault(key, set()).update(values)
             except (OSError, TypeError, ValueError) as exc:
                 logger.debug(
-                    "[股票索引] 解析代码候选失败 %s: %s",
+                    "[StockIndex] Failed to parse code candidates from %s: %s",
                     index_path,
                     exc,
                 )
@@ -416,7 +418,7 @@ def _load_active_index_rows() -> list:
     non-bundled file can never bypass the bundled baseline when the remote cache
     is missing/invalid.
     """
-    global _ACTIVE_INDEX_ROWS_CACHE
+    global _ACTIVE_INDEX_ROWS_CACHE, _CHAT_INDEX_PAYLOAD_CACHE
 
     if _ACTIVE_INDEX_ROWS_CACHE is not None:
         return _ACTIVE_INDEX_ROWS_CACHE
@@ -450,10 +452,11 @@ def _load_active_index_rows() -> list:
                     bundled_rows = rows
                     bundled_canonicals = {str(r[0]) for r in rows}
             except (OSError, TypeError, ValueError) as exc:
-                logger.debug("[股票索引] 解析 bundled 指数行失败 %s: %s", bundled_path, exc)
+                logger.debug("[StockIndex] Failed to parse bundled index rows from %s: %s", bundled_path, exc)
 
         # Second pass: pick the best candidate (remote preferred when it is a
         # legal superset of the bundled baseline).
+        stock_only_fallback = None
         for index_path in candidates:
             try:
                 raw_items = _load_stock_index_payload(index_path)
@@ -463,6 +466,8 @@ def _load_active_index_rows() -> list:
                     validate_stock_index_payload(raw_items, min_items=0)
                 rows = _extract_active_index_rows(raw_items)
                 if not rows:
+                    if stock_only_fallback is None:
+                        stock_only_fallback = raw_items
                     continue
                 _validate_index_rows_semantics(
                     rows, _extract_active_non_index_rows(raw_items)
@@ -479,20 +484,65 @@ def _load_active_index_rows() -> list:
                     missing = bundled_canonicals - candidate_canonicals
                     if missing:
                         logger.warning(
-                            "[股票索引] 指数候选 %s 缺少 bundled baseline canonical: %s — 回退 bundled",
+                            "[StockIndex] Index candidate %s is missing bundled baseline canonicals: %s - "
+                            "falling back to bundled",
                             index_path,
                             sorted(missing),
                         )
                         continue
                 _ACTIVE_INDEX_ROWS_CACHE = rows
+                _CHAT_INDEX_PAYLOAD_CACHE = raw_items
                 return rows
             except (OSError, TypeError, ValueError) as exc:
-                logger.debug("[股票索引] 解析指数行失败 %s: %s", index_path, exc)
+                logger.debug("[StockIndex] Failed to parse index rows from %s: %s", index_path, exc)
 
         # All candidates failed or were skipped — empty registry + WARNING.
-        logger.warning("[股票索引] 所有指数候选均失败，指数注册表为空")
+        logger.warning("[StockIndex] All index candidates failed; index registry is empty")
         _ACTIVE_INDEX_ROWS_CACHE = []
+        _CHAT_INDEX_PAYLOAD_CACHE = stock_only_fallback or []
         return _ACTIVE_INDEX_ROWS_CACHE
+
+
+def get_chat_stock_lookup() -> dict:
+    """Read-only name/code lookup over the existing selected, validated payload.
+
+    Keep names and registry rows from the same chosen source. A stock-only
+    candidate can supply names if no legal index candidate exists; it cannot
+    manufacture a populated index registry or validate an explicit index token.
+    """
+    global _CHAT_STOCK_LOOKUP_CACHE
+    from src.services.stock_code_utils import is_code_like
+
+    with _STOCK_INDEX_CACHE_LOCK:
+        if _CHAT_STOCK_LOOKUP_CACHE is not None:
+            return _CHAT_STOCK_LOOKUP_CACHE
+        index_rows = _load_active_index_rows()
+        names: dict[str, set[tuple[str, str, str]]] = {}
+        codes: dict[str, set[tuple[str, str, str]]] = {}
+        for row in _CHAT_INDEX_PAYLOAD_CACHE or []:
+            if len(row) < 10 or row[8] is not True:
+                continue
+            code, name = str(row[0]).strip(), str(row[2]).strip()
+            if not is_meaningful_stock_name(name, code):
+                continue
+            identity = (code, name, "index" if row[7] == "index" else "stock")
+            aliases = [alias for alias in row[5] if isinstance(alias, str)]
+            # Search aliases are not universally name aliases. Code-shaped
+            # aliases must not introduce a second name-confirmation route.
+            for label in [name] + [alias for alias in aliases if not is_code_like(alias)
+                                    and not _EXPLICIT_INDEX_ALIAS_RE.fullmatch(alias.casefold())]:
+                key = unicodedata.normalize("NFKC", label).strip().casefold()
+                if key:
+                    names.setdefault(key, set()).add(identity)
+            for key in _build_lookup_keys(code, str(row[1])):
+                codes.setdefault(key.upper(), set()).add(identity)
+                codes.setdefault(_normalize_index_identity_key(key).upper(), set()).add(identity)
+        _CHAT_STOCK_LOOKUP_CACHE = {
+            "names": {key: tuple(sorted(values)) for key, values in names.items()},
+            "codes": {key: tuple(sorted(values)) for key, values in codes.items()},
+            "index_rows": index_rows,
+        }
+        return _CHAT_STOCK_LOOKUP_CACHE
 
 
 def _get_bundled_stock_index_path(
@@ -655,12 +705,14 @@ def clear_stock_index_cache() -> None:
     """Clear the in-process stock index lookup cache."""
     global _REMOTE_INDEX_VALIDITY_CACHE
     global _STOCK_CODE_CANDIDATES_CACHE, _STOCK_CODE_LOOKUP_CACHE, _STOCK_INDEX_CACHE
-    global _ACTIVE_INDEX_ROWS_CACHE
+    global _ACTIVE_INDEX_ROWS_CACHE, _CHAT_INDEX_PAYLOAD_CACHE, _CHAT_STOCK_LOOKUP_CACHE
     with _STOCK_INDEX_CACHE_LOCK:
         _STOCK_INDEX_CACHE = None
         _STOCK_CODE_LOOKUP_CACHE = None
         _STOCK_CODE_CANDIDATES_CACHE = None
         _ACTIVE_INDEX_ROWS_CACHE = None
+        _CHAT_INDEX_PAYLOAD_CACHE = None
+        _CHAT_STOCK_LOOKUP_CACHE = None
         _REMOTE_INDEX_VALIDITY_CACHE = None
 
 

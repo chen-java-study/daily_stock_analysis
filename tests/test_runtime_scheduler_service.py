@@ -153,6 +153,21 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "not permitted"):
                 _run_scheduled_analysis_process(MagicMock(), None, {})
 
+    def test_child_restores_due_occurrence_and_returns_skip_status(self) -> None:
+        due = datetime(2026, 10, 2, 18)
+        queue = MagicMock()
+        worker = MagicMock()
+        worker._run_analysis_locked.return_value = True
+        worker._last_error = None
+        worker._last_skip_reason = "scheduled_occurrence_already_claimed"
+        with patch("src.services.runtime_scheduler.os.setsid"), patch(
+            "src.services.runtime_scheduler.RuntimeSchedulerService", return_value=worker,
+        ) as service_type:
+            _run_scheduled_analysis_process(queue, None, {"_scheduled_for": due.isoformat(), "no_notify": True})
+        service_type.assert_called_once_with(schedule_args_overrides={"no_notify": True})
+        worker._run_analysis_locked.assert_called_once_with(None, scheduled_for=due)
+        self.assertEqual(queue.put.call_args.args[0]["skipped"], "scheduled_occurrence_already_claimed")
+
     def test_analysis_timeout_reads_current_environment_with_safe_bounds(self) -> None:
         service = RuntimeSchedulerService()
 
@@ -331,7 +346,7 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
                 "the scheduler callback remained blocked by analysis",
             )
 
-            deadline = time.monotonic() + 4
+            deadline = time.monotonic() + 10
             while service.status()["last_error"] is None and time.monotonic() < deadline:
                 time.sleep(0.05)
 
@@ -340,9 +355,12 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
             self.assertIn("timed out after 1s", status["last_error"])
 
             service._analysis_process_target = _successful_spawn_runner
+            # The recovery assertion is about releasing the run lock, not
+            # whether a spawn interpreter can import dependencies within 1s.
+            service._analysis_timeout_seconds = lambda: 5
             self.assertTrue(service.run_now()["accepted"])
 
-            deadline = time.monotonic() + 4
+            deadline = time.monotonic() + 10
             while service.status()["last_success_at"] is None and time.monotonic() < deadline:
                 time.sleep(0.05)
 
@@ -442,6 +460,22 @@ class RuntimeSchedulerServiceTestCase(unittest.TestCase):
             time.sleep(0.05)
 
         self.assertTrue(service.status()["last_error"].startswith("x"))
+
+    def test_keeps_success_result_when_worker_needs_cleanup(self) -> None:
+        service = RuntimeSchedulerService(config_provider=lambda: SimpleNamespace())
+        context = MagicMock()
+        process = context.Process.return_value
+        process.is_alive.return_value = True
+        context.Queue.return_value.get.return_value = {"success": True}
+
+        with patch("src.services.runtime_scheduler.multiprocessing.get_context", return_value=context), patch(
+            "src.services.runtime_scheduler._terminate_analysis_process_tree"
+        ) as terminate:
+            service._run_analysis_with_watchdog()
+
+        terminate.assert_called_once_with(process)
+        self.assertIsNotNone(service.status()["last_success_at"])
+        self.assertIsNone(service.status()["last_error"])
 
     @unittest.skipUnless(os.name == "posix", "POSIX process-group regression")
     def test_worker_exit_without_result_terminates_remaining_process_group(self) -> None:
